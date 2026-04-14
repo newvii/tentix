@@ -4,7 +4,7 @@ import {
   buildMultimodalUserContent,
   DEFAULT_API_KEY,
   DEFAULT_BASE_URL,
-  DEFAULT_MODEL,
+  STRUCTURED_MODEL,
 } from "./workflow-tools";
 import { z } from "zod";
 import { EmotionDetectionConfig } from "@/utils/const";
@@ -60,7 +60,7 @@ export async function emotionDetectionNode(
 
   const chat = new ChatOpenAI({
     apiKey: config.llm?.apiKey || DEFAULT_API_KEY,
-    model: config.llm?.model || DEFAULT_MODEL,
+    model: config.llm?.model || STRUCTURED_MODEL,
     configuration: {
       baseURL: config.llm?.baseURL || DEFAULT_BASE_URL,
     },
@@ -68,7 +68,7 @@ export async function emotionDetectionNode(
 
   try {
     const out = await chat
-      .withStructuredOutput(sentimentDecisionSchema)
+      .withStructuredOutput(sentimentDecisionSchema, { method: "jsonMode" })
       .invoke([
         { role: "system", content: systemPrompt },
         { role: "user", content: mm },

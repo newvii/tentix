@@ -15,6 +15,8 @@ const TICKET_TITLE_MAX_CHARS = 1000;
 export const DEFAULT_API_KEY = OPENAI_CONFIG.apiKey;
 export const DEFAULT_BASE_URL = OPENAI_CONFIG.baseURL;
 export const DEFAULT_MODEL = OPENAI_CONFIG.chatModel;
+// 结构化输出专用模型（qwen-turbo 无思考模式，兼容 withStructuredOutput）
+export const STRUCTURED_MODEL = OPENAI_CONFIG.summaryModel;
 
 let sharedStore: VectorStore | undefined;
 
@@ -336,6 +338,39 @@ export function hasSummaryFlag(
   return typeof v === "boolean";
 }
 
+/**
+ * 检查 URL 是否是公网可访问的地址
+ * 过滤掉 localhost、私有 IP、minio 内部地址等 LLM API 无法访问的 URL
+ */
+function isPubliclyAccessibleUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname;
+    // 过滤 localhost
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "0.0.0.0" ||
+      hostname === "::1"
+    ) {
+      return false;
+    }
+    // 过滤私有 IP 段 (10.x, 172.16-31.x, 192.168.x)
+    if (
+      /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(hostname)
+    ) {
+      return false;
+    }
+    // 过滤没有协议或非 http/https 的 URL
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function buildMultimodalUserContent(
   promptText: string,
   state: WorkflowState,
@@ -358,7 +393,10 @@ export function buildMultimodalUserContent(
   }
 
   // 去重 + 截断（比如最多 6 张，保留最近的/靠后的）防止用户 message 和工单描述中图片过多
-  const uniq = Array.from(new Set(urls)).slice(-6);
+  // 过滤掉本地/不可访问的 URL（LLM API 无法访问 localhost 或私有地址）
+  const uniq = Array.from(new Set(urls))
+    .filter((url) => isPubliclyAccessibleUrl(url))
+    .slice(-6);
   for (const url of uniq) {
     content.push({ type: "image_url", image_url: { url } });
   }

@@ -226,6 +226,8 @@ namespace aiHandler {
 
   // In-flight lock set and timeout map to avoid concurrent AI runs per ticket
   const aiProcessingSet = new Set<string>();
+  // Tracks tickets that need re-trigger (customer messaged while AI was busy)
+  const pendingAITrigger = new Set<string>();
   const AI_PROCESSING_TIMEOUT = 180000; // 3 minute
   const aiProcessingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -281,7 +283,8 @@ namespace aiHandler {
     }
     // Skip if there's already an AI task running for this ticket
     if (aiProcessingSet.has(ticketId)) {
-      logInfo(`AI already responding for ticket ${ticketId}, skip trigger.`);
+      pendingAITrigger.add(ticketId);
+      logInfo(`AI already responding for ticket ${ticketId}, queued re-trigger.`);
       return;
     }
 
@@ -320,9 +323,6 @@ namespace aiHandler {
     }
 
     aiProcessingSet.add(ticketId);
-
-    // Baseline count to ensure consistent increment
-    const beforeCount = aiResponseCountCache.get<number>(ticketId) ?? 0;
 
     const aiUserId =
       workflowCache.getAiUserId(ticket.module) ??
@@ -371,7 +371,7 @@ namespace aiHandler {
 
           // Increment the AI response count for this ticket (use latest value)
           const latest =
-            aiResponseCountCache.get<number>(ticketId) ?? beforeCount;
+            aiResponseCountCache.get<number>(ticketId) ?? 0;
           aiResponseCountCache.set(ticketId, latest + 1);
 
           broadcastToRoom(ticketId, {
@@ -390,6 +390,14 @@ namespace aiHandler {
           if (timeout) {
             clearTimeout(timeout);
             aiProcessingTimeouts.delete(ticketId);
+          }
+
+          // Re-trigger AI if customer sent messages while AI was processing
+          if (pendingAITrigger.delete(ticketId)) {
+            const currentCount = aiResponseCountCache.get<number>(ticketId) ?? 0;
+            if (currentCount < MAX_AI_RESPONSES_PER_TICKET) {
+              handleAIResponse(ws, ticketId);
+            }
           }
         }
       },

@@ -615,7 +615,7 @@ export const knowledgeBase = tentix.table(
     chunkId: integer("chunk_id").notNull(),
     title: text("title").notNull().default(""),
     content: text("content").notNull(),
-    embedding: vector("embedding", { dimensions: 3072 }).notNull(),
+    embedding: vector("embedding", { dimensions: 1024 }).notNull(),
     metadata: jsonb("metadata").notNull(),
     score: integer("score").default(0),
     accessCount: integer("access_count").default(0),

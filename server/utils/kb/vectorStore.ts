@@ -35,7 +35,7 @@ const embedder = new OpenAIEmbeddings({
   apiKey: OPENAI_CONFIG.apiKey,
   model: OPENAI_CONFIG.embeddingModel,
   // 可选：降维（仅 text-embedding-3-* 支持）
-  dimensions: 3072, // 或 1536 / 1024 等
+  dimensions: 1024, // 阿里云 text-embedding-v3 支持的维度: 64/128/256/512/768/1024
   // 可选：批处理大小、超时、重试等
   configuration: {
     baseURL: OPENAI_CONFIG.baseURL,
@@ -72,7 +72,7 @@ export class PgVectorStore implements VectorStore {
           chunkId: d.chunk_id,
           title: d.title ?? "",
           content: d.content,
-          embedding: sql`${embVec}::tentix.vector(3072)`,
+          embedding: sql`${embVec}::tentix.vector(1024)`,
           metadata: d.metadata,
           contentHash,
           score: Math.round((SOURCE_WEIGHTS[d.source_type] ?? 0.5) * 100),
@@ -85,7 +85,7 @@ export class PgVectorStore implements VectorStore {
           ],
           set: {
             content: d.content,
-            embedding: sql`${embVec}::tentix.vector(3072)`,
+            embedding: sql`${embVec}::tentix.vector(1024)`,
             metadata: d.metadata,
             updatedAt: sql`NOW()`,
           },
@@ -113,8 +113,8 @@ export class PgVectorStore implements VectorStore {
       );
 
       // 与 ivfflat 索引一致：halfvec + cosine 距离（<=>），按“距离升序”排序
-      const lhs = sql`((${knowledgeBase.embedding})::tentix.halfvec(3072))`;
-      const rhs = sql`((${qEmbText}::tentix.vector(3072))::tentix.halfvec(3072))`;
+      const lhs = sql`((${knowledgeBase.embedding})::tentix.halfvec(1024))`;
+      const rhs = sql`((${qEmbText}::tentix.vector(1024))::tentix.halfvec(1024))`;
       const distance = sql<number>`(${lhs} OPERATOR(tentix.<=>) ${rhs})`;
 
       const conditions: SQL[] = [eq(knowledgeBase.isDeleted, false)];

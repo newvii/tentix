@@ -1140,4 +1140,290 @@ const ticketRouter = factory
     },
   );
 
-export { ticketRouter };
+// ==========================================
+// ZenTao 集成
+// ==========================================
+
+/**
+ * 将 TipTap JSON 转为 HTML
+ * 图片上传到禅道后使用禅道的 URL
+ */
+async function tiptapJsonToHtml(
+  doc: any,
+  zentaoUrl: string,
+  token: string,
+  zentaosid: string,
+): Promise<string> {
+  // 上传单张图片到禅道
+  const uploadImageToZentao = async (url: string): Promise<string> => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return url;
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const filename = url.split("/").pop() || "image.png";
+
+      const formData = new FormData();
+      formData.append("files", new Blob([buffer]), filename);
+
+      const uploadRes = await fetch(`${zentaoUrl}/api.php/v1/files`, {
+        method: "POST",
+        headers: {
+          token,
+          Cookie: `zentaosid=${zentaosid}`,
+        },
+        body: formData,
+      });
+
+      if (!uploadRes.ok) return url;
+      const data = await uploadRes.json();
+      const fileId = data.id;
+      if (fileId) {
+        // 禅道图片查看 URL
+        return `${global.customEnv.ZENTAO_URL}/file-read-${fileId}.html`;
+      }
+      return url;
+    } catch {
+      return url;
+    }
+  };
+
+  // 收集所有图片 URL
+  const imageUrls = new Set<string>();
+  const collectImages = (node: any) => {
+    if (node.type === "image" && node.attrs?.src) {
+      imageUrls.add(node.attrs.src);
+    }
+    if (node.content) node.content.forEach(collectImages);
+  };
+  if (doc.content) doc.content.forEach(collectImages);
+
+  // 并发上传所有图片
+  const urlMap = new Map<string, string>();
+  await Promise.all(
+    Array.from(imageUrls).map(async (src) => {
+      const zentaoImgUrl = await uploadImageToZentao(src);
+      urlMap.set(src, zentaoImgUrl);
+    }),
+  );
+
+  // 处理节点
+  const processNode = (node: any): string => {
+    const type = node.type || "";
+
+    if (type === "text") return node.text || "";
+
+    if (type === "paragraph") {
+      if (!node.content) return "<p></p>";
+      return `<p>${node.content.map(processNode).join("")}</p>`;
+    }
+
+    if (type === "heading") {
+      const level = node.attrs?.level || 1;
+      if (!node.content) return `<h${level}></h${level}>`;
+      return `<h${level}>${node.content.map(processNode).join("")}</h${level}>`;
+    }
+
+    if (type === "image") {
+      const src = urlMap.get(node.attrs?.src) || node.attrs?.src || "";
+      const alt = node.attrs?.alt || "";
+      return `<p><img src="${src}" /></p>`;
+    }
+
+    if (type === "bulletList") {
+      if (!node.content) return "";
+      return `<ul>${node.content.map(processNode).join("")}</ul>`;
+    }
+
+    if (type === "listItem") {
+      if (!node.content) return "<li></li>";
+      return `<li>${node.content.map(processNode).join("")}</li>`;
+    }
+
+    if (type === "orderedList") {
+      if (!node.content) return "";
+      return `<ol>${node.content.map(processNode).join("")}</ol>`;
+    }
+
+    if (node.content) return node.content.map(processNode).join("");
+    return "";
+  };
+
+  return doc.content.map(processNode).join("");
+}
+
+interface ZenTaoLoginResult {
+  token: string;
+  zentaosid: string;
+}
+
+async function zentaoLogin(): Promise<ZenTaoLoginResult> {
+  const { ZENTAO_URL, ZENTAO_USERNAME, ZENTAO_PASSWORD } = global.customEnv;
+  if (!ZENTAO_URL || !ZENTAO_USERNAME || !ZENTAO_PASSWORD) {
+    throw new Error("ZenTao 配置不完整，请检查环境变量配置");
+  }
+
+  const loginUrl = `${ZENTAO_URL}/api.php/v1/tokens`;
+  const response = await fetch(loginUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      account: ZENTAO_USERNAME,
+      password: ZENTAO_PASSWORD,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`ZenTao 登录失败: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json();
+  if (!data.token) {
+    throw new Error("ZenTao 返回数据格式异常：缺少 token");
+  }
+
+  // Extract zentaosid from Set-Cookie header
+  const setCookie = response.headers.get("set-cookie") || "";
+  const zentaosidMatch = setCookie.match(/zentaosid=([^;]+)/);
+  const zentaosid = zentaosidMatch ? zentaosidMatch[1] : data.token;
+
+  return { token: data.token, zentaosid };
+}
+
+const router = ticketRouter
+  .post(
+    "/zentao/products",
+    staffOnlyMiddleware(),
+    describeRoute({
+      description: "获取禅道产品列表",
+      tags: ["Ticket"],
+      security: [{ bearerAuth: [] }],
+      responses: {
+        200: { description: "产品列表" },
+      },
+    }),
+    async (c) => {
+      try {
+        const { token, zentaosid } = await zentaoLogin();
+        const productsUrl = `${global.customEnv.ZENTAO_URL}/api.php/v1/products`;
+        const response = await fetch(productsUrl, {
+          headers: {
+            "Content-Type": "application/json",
+            "token": token,
+            "Cookie": `zentaosid=${zentaosid}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error(`获取禅道产品列表失败: ${response.status}`);
+        }
+
+        const data = await response.json();
+        // 禅道返回格式: { products: [...], page, total, limit }
+        const products = Array.isArray(data.products) ? data.products : [];
+        return c.json({ products });
+      } catch (error: any) {
+        return c.json({ error: error.message }, 500);
+      }
+    },
+  )
+  .post(
+    "/zentao/create-bug",
+    staffOnlyMiddleware(),
+    describeRoute({
+      description: "转禅道创建 bug",
+      tags: ["Ticket"],
+      security: [{ bearerAuth: [] }],
+      responses: {
+        200: { description: "创建成功，返回 bug id" },
+      },
+    }),
+    zValidator(
+      "json",
+      z.object({
+        ticketId: z.string(),
+        productId: z.coerce.number(),
+        pri: z.coerce.number().min(1).max(4).default(3),
+        severity: z.coerce.number().min(1).max(4).default(3),
+        type: z.enum(["codeerror", "config", "install", "security", "performance", "standard", "automation", "designdefect", "others"]).default("codeerror"),
+        openedBuild: z.array(z.string()).default(["trunk"]),
+      }),
+    ),
+    async (c) => {
+      try {
+        const { ticketId, productId, pri, severity, type, openedBuild } = c.req.valid("json");
+        const db = c.var.db;
+
+        // 从数据库读取工单信息
+        const ticket = await db.query.tickets.findFirst({
+          where: eq(schema.tickets.id, ticketId),
+        });
+        if (!ticket) {
+          throw new Error("工单不存在");
+        }
+
+        // 将 TipTap JSON 描述转为 HTML（图片上传到禅道）
+        const { token, zentaosid } = await zentaoLogin();
+        const steps = await tiptapJsonToHtml(
+          ticket.description as any,
+          global.customEnv.ZENTAO_URL,
+          token,
+          zentaosid,
+        );
+
+        const bugUrl = `${global.customEnv.ZENTAO_URL}/api.php/v1/products/${productId}/bugs`;
+        const response = await fetch(bugUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "token": token,
+            "Cookie": `zentaosid=${zentaosid}`,
+          },
+          body: JSON.stringify({
+            title: ticket.title,
+            steps,
+            pri,
+            severity,
+            type,
+            openedBuild: [openedBuild],
+          }),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`创建禅道 bug 失败: ${response.status} - ${errorText}`);
+        }
+
+        const data = await response.json();
+        const bugId = data.id || data.data?.id;
+
+        if (!bugId) {
+          throw new Error("创建禅道 bug 成功但未返回 bug id");
+        }
+
+        // 更新工单状态为"处理中"
+        await db
+          .update(schema.tickets)
+          .set({
+            status: "in_progress",
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(schema.tickets.id, ticketId));
+
+        // 记录到工单历史
+        await db.insert(schema.ticketHistory).values({
+          type: "transfer",
+          operatorId: c.var.userId,
+          meta: bugId,
+          description: `ZenTao Bug #${bugId}`,
+          ticketId,
+        });
+
+        return c.json({ success: true, bugId });
+      } catch (error: any) {
+        return c.json({ error: error.message }, 500);
+      }
+    },
+  );
+
+export { router as ticketRouter };

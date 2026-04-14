@@ -9,6 +9,8 @@ import { convertToMultimodalMessage, sleep } from "./tools";
 import { basicUserCols } from "../../api/queryParams.ts";
 import { type JSONContentZod } from "../types";
 import { type JSONContent } from "@tiptap/core";
+import { type WorkflowConfig, NodeType } from "@/utils/const.ts";
+import { emotionDetectionNode, escalationOfferNode, ragNode, chatNode, handoffNode } from "./workflow-node/index.ts";
 
 /**
  * 工作流缓存管理类
@@ -54,6 +56,10 @@ export class WorkflowCache {
     }
   > = new Map();
 
+  // 第三层缓存：workflowId -> 原始工作流配置（含 node config）
+  // 用于并行执行时直接获取各节点的 config
+  private workflowConfigCache: Map<string, WorkflowConfig> = new Map();
+
   /**
    * 初始化缓存
    *
@@ -94,13 +100,16 @@ export class WorkflowCache {
       `[WorkflowCache] Found ${activeConfigs.length} active AI role configs`,
     );
 
-    // 清空两层缓存
+    // 清空三层缓存
     this.workflowCache.clear();
     this.scopeCache.clear();
+    this.workflowConfigCache.clear();
 
     // 第一层缓存：编译所有工作流（不仅仅是激活的）
     for (const workflow of allWorkflows) {
       try {
+        // 保存原始配置到第三层缓存
+        this.workflowConfigCache.set(workflow.id, workflow);
         if (!workflow.nodes || !workflow.edges) {
           logInfo(
             `[WorkflowCache] Skipping workflow ${workflow.id} (${workflow.name}) - invalid nodes or edges`,
@@ -337,6 +346,22 @@ export class WorkflowCache {
   }
 
   /**
+   * 根据工作流 ID 获取原始配置
+   */
+  getWorkflowConfig(workflowId: string): WorkflowConfig | null {
+    return this.workflowConfigCache.get(workflowId) ?? null;
+  }
+
+  /**
+   * 根据 scope 获取工作流配置
+   */
+  getWorkflowConfigByScope(scope: string): WorkflowConfig | null {
+    const scopeInfo = this.scopeCache.get(scope);
+    if (!scopeInfo) return null;
+    return this.workflowConfigCache.get(scopeInfo.workflowId) ?? null;
+  }
+
+  /**
    * 获取所有已缓存的 scope
    *
    * @returns {string[]} scope 列表
@@ -486,6 +511,7 @@ export class WorkflowCache {
     logInfo("[WorkflowCache] Clearing all cached workflows");
     this.workflowCache.clear();
     this.scopeCache.clear();
+    this.workflowConfigCache.clear();
   }
 }
 
@@ -516,6 +542,92 @@ type MessageWithSender = Pick<
     "id" | "name" | "nickname" | "avatar" | "role"
   > | null;
 };
+
+/**
+ * 从工作流配置中按节点类型提取 config
+ */
+function findNodeConfig<T extends { type: NodeType; config: any }>(
+  workflowConfig: WorkflowConfig,
+  nodeType: NodeType,
+): T | undefined {
+  return workflowConfig.nodes.find((n) => n.type === nodeType) as
+    | T
+    | undefined;
+}
+
+/**
+ * 合并多个节点的状态更新到初始状态
+ */
+function mergeStateUpdates(
+  initial: WorkflowState,
+  ...updates: Partial<WorkflowState>[]
+): WorkflowState {
+  let merged = { ...initial };
+  for (const update of updates) {
+    merged = { ...merged, ...update };
+  }
+  return merged;
+}
+
+/**
+ * 并行执行模式：跳过 LangGraph 串行调度，手动并行运行预处理节点
+ *
+ * 流程：
+ * 1. 并行执行 emotion_detection + escalation_offer + rag_node
+ * 2. 如果需要转人工 → 执行 handoff_node
+ * 3. 如果 escalation 提议升级且有 response → 直接返回
+ * 4. 执行 chat_node 生成最终回复
+ */
+async function executeParallelWorkflow(
+  initialState: WorkflowState,
+  workflowConfig: WorkflowConfig,
+): Promise<string> {
+  const emotionConfig = findNodeConfig(workflowConfig, NodeType.EMOTION_DETECTOR);
+  const escalationConfig = findNodeConfig(workflowConfig, NodeType.ESCALATION_OFFER);
+  const ragConfig = findNodeConfig(workflowConfig, NodeType.RAG);
+  const chatConfig = findNodeConfig(workflowConfig, NodeType.SMART_CHAT);
+  const handoffConfig = findNodeConfig(workflowConfig, NodeType.HANDOFF);
+
+  // 并行执行预处理节点（互不依赖）
+  const [emotionResult, escalationResult, ragResult] = await Promise.all([
+    emotionConfig
+      ? emotionDetectionNode(initialState, emotionConfig.config)
+      : Promise.resolve<Partial<WorkflowState>>({}),
+    escalationConfig
+      ? escalationOfferNode(initialState, escalationConfig.config)
+      : Promise.resolve<Partial<WorkflowState>>({}),
+    ragConfig
+      ? ragNode(initialState, ragConfig.config)
+      : Promise.resolve<Partial<WorkflowState>>({}),
+  ]);
+
+  // 合并状态
+  const state = mergeStateUpdates(
+    initialState,
+    emotionResult,
+    escalationResult,
+    ragResult,
+  );
+
+  // 转人工
+  if (state.handoffRequired && handoffConfig) {
+    const handoffResult = await handoffNode(state, handoffConfig.config);
+    return handoffResult.response || "";
+  }
+
+  // 升级提议（escalation 节点直接生成了 response）
+  if (state.proposeEscalation && escalationResult?.response) {
+    return escalationResult.response;
+  }
+
+  // 生成最终回复
+  if (chatConfig) {
+    const chatResult = await chatNode(state, chatConfig.config);
+    return chatResult.response || "";
+  }
+
+  return "";
+}
 
 export async function getAIResponse(
   ticket: Pick<
@@ -560,30 +672,6 @@ export async function getAIResponse(
     });
   }
 
-  // 3) 组装到状态
-  /*
-      [
-      {
-        role: "ai",
-        content: "some text",
-        createdAt: "2025-08-15 16:24:13.307+00",
-      }, {
-        role: "customer",
-        content: [
-          {
-            type: "text",
-            text: "some text",
-          }, {
-            type: "image_url",
-            image_url: {
-              url: "https://xxx.com/xxx.png",
-            },
-          }
-        ],
-        createdAt: "2025-08-15 16:24:43.275+00",
-      }
-    ]
-  */
   const history: AgentMessage[] = [];
   for (const m of msgs) {
     if (!m) continue;
@@ -603,23 +691,6 @@ export async function getAIResponse(
     return at - bt;
   });
 
-  let workflow;
-  if (isWorkflowTest) {
-    workflow = workflowCache.getWorkflowById(workflowId);
-  } else {
-    workflow =
-      workflowCache.getWorkflow(ticket.module) ??
-      workflowCache.getFallbackWorkflow();
-  }
-
-  if (!workflow) {
-    const availableScopes = workflowCache.getScopes();
-    throw new Error(
-      `No workflow available for scope: ${ticket.module}. ` +
-        `Fallback workflow (default_all) is also missing. ` +
-        `Available scopes: ${availableScopes.join(", ") || "none"}`,
-    );
-  }
   // 准备初始状态
   const initialState: WorkflowState = {
     messages: history,
@@ -645,24 +716,47 @@ export async function getAIResponse(
     variables: {},
   };
 
-  // 当响应为空字符串时，进行最多三次重试（总尝试次数最多四次）
-  const maxRetries = 3;
-  let attempt = 0;
-
-  while (attempt <= maxRetries) {
+  // 工作流测试：使用 LangGraph 串行执行
+  if (isWorkflowTest) {
+    const workflow = workflowCache.getWorkflowById(workflowId);
+    if (!workflow) {
+      throw new Error(`No workflow found for workflowId: ${workflowId}`);
+    }
     try {
       const result = (await workflow.invoke(initialState)) as WorkflowState;
-      const response = result.response ?? "";
+      return result.response ?? "";
+    } catch (e) {
+      logError(String(e));
+      return "";
+    }
+  }
+
+  // 生产环境：获取工作流配置，并行执行
+  const workflowConfig =
+    workflowCache.getWorkflowConfigByScope(ticket.module) ??
+    workflowCache.getWorkflowConfigByScope("default_all");
+
+  if (!workflowConfig) {
+    const availableScopes = workflowCache.getScopes();
+    throw new Error(
+      `No workflow available for scope: ${ticket.module}. ` +
+        `Available scopes: ${availableScopes.join(", ") || "none"}`,
+    );
+  }
+
+  // 重试逻辑（无 sleep）
+  const maxRetries = 3;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await executeParallelWorkflow(
+        initialState,
+        workflowConfig,
+      );
       if (response !== "") {
         return response;
       }
     } catch (e) {
       logError(String(e));
-    }
-
-    attempt++;
-    if (attempt <= maxRetries) {
-      await sleep(300);
     }
   }
 
@@ -678,124 +772,12 @@ export async function* streamAIResponse(
   isWorkflowTest: boolean = false,
   workflowId?: string,
 ) {
-  const db = connectDB();
-  // 查询该工单的对话（带 sender 用户信息），按时间升序
-  let msgs: MessageWithSender[];
-  if (isWorkflowTest) {
-    msgs = await db.query.workflowTestMessage.findMany({
-      where: (m, { eq }) => eq(m.testTicketId, ticket.id),
-      orderBy: [asc(schema.workflowTestMessage.createdAt)],
-      columns: {
-        id: true,
-        senderId: true,
-        content: true,
-        createdAt: true,
-      },
-      with: {
-        sender: basicUserCols,
-      },
-    });
-  } else {
-    msgs = await db.query.chatMessages.findMany({
-      where: (m, { and, eq }) =>
-        and(eq(m.ticketId, ticket.id), eq(m.isInternal, false)),
-      orderBy: [asc(schema.chatMessages.createdAt)],
-      columns: {
-        id: true,
-        senderId: true,
-        content: true,
-        createdAt: true,
-      },
-      with: {
-        sender: basicUserCols,
-      },
-    });
+  // 流式模式下，直接调用 getAIResponse（并行执行已内置）
+  // 流式 yield 将在 chat_node 逐步返回时产生
+  const result = await getAIResponse(ticket, isWorkflowTest, workflowId);
+  if (result) {
+    yield result;
   }
-
-  const history: AgentMessage[] = [];
-  for (const m of msgs) {
-    if (!m) continue;
-    let role = m.sender?.role ?? "user";
-    // 当 isWorkflowTest 为 true 时，所有非 ai 的 role 都改成 customer
-    if (isWorkflowTest && role !== "ai") {
-      role = "customer";
-    }
-    const multimodalContent = convertToMultimodalMessage(
-      m.content as JSONContentZod,
-    );
-    history.push({ role, content: multimodalContent, createdAt: m.createdAt });
-  }
-  history.sort((a: AgentMessage, b: AgentMessage) => {
-    const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-    const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-    return at - bt;
-  });
-
-  let workflow;
-  if (isWorkflowTest) {
-    workflow = workflowCache.getWorkflowById(workflowId);
-  } else {
-    workflow =
-      workflowCache.getWorkflow(ticket.module) ??
-      workflowCache.getFallbackWorkflow();
-  }
-
-  if (!workflow) {
-    const availableScopes = workflowCache.getScopes();
-    throw new Error(
-      `No workflow available for scope: ${ticket.module}. ` +
-        `Fallback workflow (default_all) is also missing. ` +
-        `Available scopes: ${availableScopes.join(", ") || "none"}`,
-    );
-  }
-
-  // 准备初始状态
-  const initialState: WorkflowState = {
-    messages: history,
-    currentTicket: ticket
-      ? {
-          id: ticket.id,
-          title: ticket.title,
-          description: ticket.description as JSONContentZod | undefined,
-          module: ticket.module ?? undefined,
-          category: ticket.category ?? undefined,
-        }
-      : undefined,
-    userQuery: "",
-    sentimentLabel: "NEUTRAL",
-    handoffRequired: false,
-    handoffReason: "",
-    handoffPriority: "P2",
-    searchQueries: [],
-    retrievedContext: [],
-    response: "",
-    proposeEscalation: false,
-    escalationReason: "",
-    variables: {},
-  };
-
-  // 使用 stream 方法进行流式处理
-  const stream = await workflow.stream(initialState);
-
-  // BUG: 应该只拿 smart chat 的 response
-  for await (const chunk of stream) {
-    // 不关心具体是哪个节点，只要有response就输出
-    const updates = chunk as Record<string, any>;
-
-    for (const [nodeId, update] of Object.entries(updates)) {
-      if (update?.response) {
-        yield update.response;
-        break; // 假设每个chunk只有一个节点有response
-      }
-    }
-  }
-
-  // for await (const chunk of stream) {
-  //   // 每个 chunk 包含节点名称和状态更新
-  //   if (chunk.generateResponse?.response) {
-  //     yield chunk.generateResponse.response;
-  //   }
-  // }
 }
 
 /**

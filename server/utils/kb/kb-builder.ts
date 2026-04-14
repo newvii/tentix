@@ -234,7 +234,7 @@ export class KnowledgeBuilderService {
         },
       });
 
-      const structured = model.withStructuredOutput(schema);
+      const structured = model.withStructuredOutput(schema, { method: "json_mode" });
 
       // 构建多模态消息，包含工单描述和历史对话中的图片
       const ticketDescImages = extractImageUrls(

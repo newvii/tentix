@@ -4,7 +4,7 @@ import {
   buildMultimodalUserContent,
   DEFAULT_API_KEY,
   DEFAULT_BASE_URL,
-  DEFAULT_MODEL,
+  STRUCTURED_MODEL,
   sanitizeQuery,
   getStore,
   hasSummaryFlag,
@@ -48,7 +48,7 @@ export async function ragNode(
         config.intentAnalysisConfig?.intentAnalysisLLM?.apiKey ||
         DEFAULT_API_KEY,
       model:
-        config.intentAnalysisConfig?.intentAnalysisLLM?.model || DEFAULT_MODEL,
+        config.intentAnalysisConfig?.intentAnalysisLLM?.model || STRUCTURED_MODEL,
       configuration: {
         baseURL:
           config.intentAnalysisConfig?.intentAnalysisLLM?.baseURL ||
@@ -67,7 +67,7 @@ export async function ragNode(
       variables,
     );
 
-    const fastStructured = chat.withStructuredOutput(decisionSchema);
+    const fastStructured = chat.withStructuredOutput(decisionSchema, { method: "jsonMode" });
 
     // 4) 多模态：仅带“最近客户消息”的图片，减少噪音（第三个参数 false）描述的图片不携带
     const mm = buildMultimodalUserContent(userPrompt, state, false);
@@ -90,7 +90,7 @@ export async function ragNode(
     const moduleFilter = variables.currentTicket?.module;
     const chat = new ChatOpenAI({
       apiKey: config.generateSearchQueriesLLM?.apiKey || DEFAULT_API_KEY,
-      model: config.generateSearchQueriesLLM?.model || DEFAULT_MODEL,
+      model: config.generateSearchQueriesLLM?.model || STRUCTURED_MODEL,
       configuration: {
         baseURL: config.generateSearchQueriesLLM?.baseURL || DEFAULT_BASE_URL,
       },
@@ -108,10 +108,10 @@ export async function ragNode(
     );
 
     // 3) 结构化输出 schema
-    const fastStructured = chat.withStructuredOutput(qsSchema);
+    const fastStructured = chat.withStructuredOutput(qsSchema, { method: "jsonMode" });
 
-    // 4) 多模态：附带工单描述图与最近客户消息的图片
-    const mm = buildMultimodalUserContent(userPrompt, state);
+    // 4) 仅用文本，不附带图片（内部图片 URL 无法被外部 LLM API 访问）
+    const mm = buildMultimodalUserContent(userPrompt, state, false);
 
     try {
       const out = await fastStructured.invoke([
@@ -202,9 +202,29 @@ export async function ragNode(
         results.push(fallbackResult);
       } catch (fallbackError) {
         logError("Fallback search also failed:", fallbackError);
-        // 彻底失败，返回空结果
+      }
+    }
+
+    // 如果有 module 过滤但未找到结果，去掉过滤重试
+    const totalHits = results.reduce((sum, r) => sum + r.length, 0);
+    if (totalHits === 0 && moduleFilter) {
+      try {
+        const noFilterResults = await Promise.allSettled(
+          queries.slice(0, 2).map((q) => searchWithTimeout(q, BASE_K)),
+        );
+        for (const r of noFilterResults) {
+          if (r.status === "fulfilled" && r.value.length > 0) {
+            results.push(r.value);
+          }
+        }
+      } catch {
+        // 去掉过滤也搜不到，返回空结果
         return { retrievedContext: [] };
       }
+    }
+
+    if (results.every((r) => r.length === 0)) {
+      return { retrievedContext: [] };
     }
 
     // 合并并对"摘要"轻微加分（优先召回 chunk_id=0 / metadata.is_summary）

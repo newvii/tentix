@@ -47,6 +47,11 @@ const envSchema = z.object({
   THIRD_PARTY_TOKEN: z.string().trim().optional(),
   FORUM_URL: z.string().url().trim().default("https://forum.sealos.run"),
   NODE_ENV: z.enum(["development", "production"]).default("development"),
+
+  // ZenTao 配置
+  ZENTAO_URL: z.string().url().trim().optional(),
+  ZENTAO_USERNAME: z.string().trim().optional(),
+  ZENTAO_PASSWORD: z.string().trim().optional(),
 });
 
 try {

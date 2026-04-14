@@ -142,7 +142,7 @@ ${tagStatsList}`;
 function createOpenAIClient(): ChatOpenAI {
   return new ChatOpenAI({
     apiKey: OPENAI_CONFIG.apiKey,
-    model: OPENAI_CONFIG.analysisModel,
+    model: OPENAI_CONFIG.summaryModel,
     temperature: 0.3,
     configuration: {
       baseURL: OPENAI_CONFIG.baseURL,
@@ -186,6 +186,7 @@ export async function generateAIInsights(
     const model = createOpenAIClient();
     const structuredModel = model.withStructuredOutput(aiInsightsSchema, {
       strict: true,
+      method: "json_mode",
     });
     const userMessage = buildUserMessage(topIssues, tagStats, totalIssues);
     const result = await withTimeout(

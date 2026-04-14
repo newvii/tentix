@@ -222,7 +222,7 @@ async function analyzeWithAI(
 ): Promise<AIAnalysisResult> {
   const model = new ChatOpenAI({
     apiKey: OPENAI_CONFIG.apiKey,
-    model: OPENAI_CONFIG.analysisModel,
+    model: OPENAI_CONFIG.summaryModel,
     temperature: CONFIG.AI_TEMPERATURE,
     configuration: {
       baseURL: OPENAI_CONFIG.baseURL,
@@ -230,7 +230,7 @@ async function analyzeWithAI(
   });
   const systemPrompt = buildSystemPrompt(existingTags);
   const userContent = buildUserContent(title, description);
-  const structuredModel = model.withStructuredOutput(hotIssueAnalysisSchema);
+  const structuredModel = model.withStructuredOutput(hotIssueAnalysisSchema, { method: "json_mode" });
   const result = await structuredModel.invoke([
     { role: "system", content: systemPrompt },
     { role: "user", content: userContent },

@@ -4,7 +4,7 @@ import {
   buildMultimodalUserContent,
   DEFAULT_API_KEY,
   DEFAULT_BASE_URL,
-  DEFAULT_MODEL,
+  STRUCTURED_MODEL,
 } from "./workflow-tools";
 import { z } from "zod";
 import { EscalationOfferConfig } from "@/utils/const";
@@ -39,7 +39,7 @@ export async function escalationOfferNode(
 
   const chat = new ChatOpenAI({
     apiKey: config.llm?.apiKey || DEFAULT_API_KEY,
-    model: config.llm?.model || DEFAULT_MODEL,
+    model: config.llm?.model || STRUCTURED_MODEL,
     configuration: {
       baseURL: config.llm?.baseURL || DEFAULT_BASE_URL,
     },
@@ -47,7 +47,7 @@ export async function escalationOfferNode(
 
   try {
     const out = await chat
-      .withStructuredOutput(escalationDecisionSchema)
+      .withStructuredOutput(escalationDecisionSchema, { method: "jsonMode" })
       .invoke([
         { role: "system", content: systemPrompt },
         { role: "user", content: mm },
